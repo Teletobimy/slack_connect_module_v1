@@ -167,6 +167,9 @@ class SlackChannelReporter:
                     self.db_connection_type = "Direct (포트 5432)"
                     self._log("✅ Supabase 연결 성공 (Direct connection)")
                     self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
+                    
+                    # 테이블 자동 생성 확인 및 실행
+                    self._ensure_tables_exist()
                 except Exception as e:
                     error_msg = str(e).lower()
                     # IPv4/DNS 문제인 경우 Session Pooler로 재시도
@@ -194,6 +197,9 @@ class SlackChannelReporter:
                                 self._log("✅ Supabase 연결 성공 (Session Pooler)")
                                 self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
                                 self.db_conn_string = pooler_string  # 나중에 사용하기 위해 저장
+                                
+                                # 테이블 자동 생성 확인 및 실행
+                                self._ensure_tables_exist()
                             except Exception as e2:
                                 self.db_connection_status = f"연결 실패: {str(e2)[:100]}"
                                 self._log(f"❌ Session Pooler 연결도 실패: {e2}")
@@ -939,6 +945,59 @@ class SlackChannelReporter:
         
         # 기본: print로 출력
         print(message)
+    
+    def _ensure_tables_exist(self):
+        """필수 테이블이 없으면 자동으로 생성"""
+        if not self.db_conn:
+            return
+        
+        try:
+            # 필수 테이블 목록 확인
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name IN ('messages', 'channels', 'users', 'gpt_analyses');
+            """)
+            existing_tables = {row[0] for row in cursor.fetchall()}
+            cursor.close()
+            
+            required_tables = {'messages', 'channels', 'users', 'gpt_analyses'}
+            missing_tables = required_tables - existing_tables
+            
+            if missing_tables:
+                self._log(f"⚠️ 테이블 누락 감지: {', '.join(missing_tables)}")
+                self._log("🔧 자동으로 테이블 생성 중...")
+                
+                # create_tables.sql 파일 읽기
+                sql_file_path = os.path.join(os.path.dirname(__file__), 'sql', 'create_tables.sql')
+                if os.path.exists(sql_file_path):
+                    with open(sql_file_path, 'r', encoding='utf-8') as f:
+                        sql_script = f.read()
+                    
+                    # SQL 스크립트 실행
+                    cursor = self.db_conn.cursor()
+                    try:
+                        # 세미콜론으로 구분된 각 명령 실행
+                        for statement in sql_script.split(';'):
+                            statement = statement.strip()
+                            if statement and not statement.startswith('--'):
+                                cursor.execute(statement)
+                        self.db_conn.commit()
+                        cursor.close()
+                        self._log("✅ 테이블 생성 완료!")
+                    except Exception as e:
+                        self.db_conn.rollback()
+                        cursor.close()
+                        self._log(f"⚠️ 테이블 생성 중 오류 발생: {str(e)[:200]}")
+                        self._log("💡 수동으로 sql/create_tables.sql을 Supabase SQL Editor에서 실행하세요.")
+                else:
+                    self._log(f"⚠️ sql/create_tables.sql 파일을 찾을 수 없습니다.")
+                    self._log("💡 수동으로 Supabase SQL Editor에서 테이블을 생성하세요.")
+            else:
+                self._log("✅ 모든 필수 테이블이 존재합니다.")
+        except Exception as e:
+            self._log(f"⚠️ 테이블 확인 중 오류: {str(e)[:200]}")
     
     def _update_progress(self, progress: float, status: str):
         """진행률 업데이트 (Streamlit 또는 무시)"""
