@@ -21,13 +21,14 @@ import json
 
 # Windows 콘솔 인코딩 문제 해결 (가장 먼저 실행)
 if sys.platform == "win32":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-    # PowerShell UTF-8 설정
-    try:
-        os.system('chcp 65001 >nul 2>&1')
-    except:
-        pass
+    # 이미 설정되어 있지 않은 경우에만 설정
+    if not isinstance(sys.stdout, io.TextIOWrapper) or sys.stdout.encoding.lower() != 'utf-8':
+        try:
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+            sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+        except (AttributeError, ValueError):
+            # 이미 닫혔거나 재설정할 수 없는 경우 무시
+            pass
 
 try:
     from openai import OpenAI

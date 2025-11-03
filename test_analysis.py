@@ -6,17 +6,19 @@ Streamlit 없이 진행률과 로그를 터미널에서 확인할 수 있습니�
 
 import os
 import sys
-import io
 from datetime import datetime
-from channel_report import SlackChannelReporter
 
 # Windows 콘솔 인코딩 문제 해결 (UTF-8 강제 적용)
+# channel_report.py가 import되기 전에 먼저 실행
 if sys.platform == "win32":
-    # UTF-8 인코딩 강제 설정
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-    # PowerShell UTF-8 설정
-    os.system('chcp 65001 >nul 2>&1')
+    try:
+        # PowerShell UTF-8 설정
+        os.system('chcp 65001 >nul 2>&1')
+    except:
+        pass
+
+# channel_report import (이미 UTF-8 설정이 되어 있음)
+from channel_report import SlackChannelReporter
 
 
 def main():
