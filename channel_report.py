@@ -13,10 +13,21 @@ import re
 import html
 import time
 import hashlib
+import io
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import json
+
+# Windows 콘솔 인코딩 문제 해결 (가장 먼저 실행)
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    # PowerShell UTF-8 설정
+    try:
+        os.system('chcp 65001 >nul 2>&1')
+    except:
+        pass
 
 try:
     from openai import OpenAI
@@ -32,12 +43,6 @@ try:
 except ImportError:
     SUPABASE_AVAILABLE = False
     print("⚠️ supabase 또는 psycopg2 라이브러리가 설치되지 않았습니다.")
-
-# Windows 콘솔 인코딩 문제 해결
-if sys.platform == "win32":
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 # 정규표현식 패턴
 MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)>")
@@ -96,6 +101,9 @@ class SlackChannelReporter:
         self.user_cache = {}
         # user_id -> user_name 매핑 (DB용)
         self.user_id_to_name = {}
+        # Streamlit 진행률 콜백 함수들
+        self.progress_callback = None  # 진행률 업데이트 콜백 (progress_value, status_text)
+        self.log_callback = None  # 로그 출력 콜백 (message)
     
     def _slack_get(self, url: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Optional[requests.Response]:
         """
@@ -178,7 +186,7 @@ class SlackChannelReporter:
     
     def check_existing_week(self, user_id: str, week_start: datetime) -> bool:
         """
-        DB에서 특정 사용자의 특정 주차 분석이 이미 존재하는지 확인
+        DB에서 특정 사용자의 특정 주차 분석이 이미 존재하는지 확인 (gpt_analyses 테이블 기준)
         
         Args:
             user_id: Slack 사용자 ID
@@ -193,7 +201,7 @@ class SlackChannelReporter:
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
-                "SELECT COUNT(*) FROM metrics_weekly WHERE user_id = %s AND week_start = %s",
+                "SELECT COUNT(*) FROM gpt_analyses WHERE user_id = %s AND week_start = %s",
                 (user_id, week_start.date())
             )
             count = cursor.fetchone()[0]
@@ -380,7 +388,7 @@ class SlackChannelReporter:
         """
         all_channels = []
         
-        print("📡 채널 목록 수집 중...")
+        self._log("📡 채널 목록 수집 중...")
         
         # 채널 타입: 공개, 비공개, 다중 DM, 1:1 DM
         channel_types_list = [
@@ -425,14 +433,14 @@ class SlackChannelReporter:
                     error = data.get("error")
                     if error == "missing_scope":
                         if "private_channel" in channel_types:
-                            print(f"⚠️ groups:read 권한이 없어 {type_name} 목록을 건너뜁니다.")
+                            self._log(f"⚠️ groups:read 권한이 없어 {type_name} 목록을 건너뜁니다.")
                         elif "mpim" in channel_types or "im" in channel_types:
-                            print(f"⚠️ im:read, mpim:read 권한이 없어 {type_name} 목록을 건너뜁니다.")
+                            self._log(f"⚠️ im:read, mpim:read 권한이 없어 {type_name} 목록을 건너뜁니다.")
                         else:
-                            print(f"❌ {type_name} 목록 조회 오류: {error}")
-                            print("💡 channels:read 권한이 필요합니다.")
+                            self._log(f"❌ {type_name} 목록 조회 오류: {error}")
+                            self._log("💡 channels:read 권한이 필요합니다.")
                     else:
-                        print(f"⚠️ {type_name} 목록 조회 오류: {error}")
+                        self._log(f"⚠️ {type_name} 목록 조회 오류: {error}")
                     break
                 
                 channels = data.get("channels", [])
@@ -469,7 +477,7 @@ class SlackChannelReporter:
                 if not cursor:
                     break
         
-        print(f"✅ 총 {len(all_channels)}개 채널 발견")
+        self._log(f"✅ 총 {len(all_channels)}개 채널 발견")
         return all_channels
     
     def get_thread_replies(self, channel_id: str, thread_ts: str) -> List[Dict[str, Any]]:
@@ -749,34 +757,52 @@ class SlackChannelReporter:
             print(f"  ⚠️ GPT 분석 오류 ({user_name} {week_range}): {e}")
             return None
     
+    def _log(self, message: str):
+        """로그 출력 (Streamlit 또는 print)"""
+        if self.log_callback:
+            self.log_callback(message)
+            # Streamlit인 경우에만 UI 업데이트를 위한 대기 (콜백이 Streamlit인지 확인)
+            # 터미널에서는 sleep이 필요 없으므로 제거
+        else:
+            print(message)
+    
+    def _update_progress(self, progress: float, status: str):
+        """진행률 업데이트 (Streamlit 또는 무시)"""
+        if self.progress_callback:
+            self.progress_callback(progress, status)
+            # Streamlit인 경우에만 UI 업데이트를 위한 대기
+            # 터미널에서는 sleep이 필요 없으므로 제거
+    
     def generate_weekly_analysis_report(self):
         """
         10월 1일부터 오늘까지의 메시지를 수집하고 주별로 분석하여
         CEO/관리자용 업무 분석 리포트 생성
         """
-        print("=" * 80)
-        print("📊 Slack 담당자별 주간 업무 분석 리포트 (CEO/관리자용)")
-        print("=" * 80)
-        print()
+        self._log("=" * 80)
+        self._log("📊 Slack 담당자별 주간 업무 분석 리포트 (CEO/관리자용)")
+        self._log("=" * 80)
+        self._log("")
         
         # 기간 설정 (10/20부터 또는 전주 월요일부터)
         start_date, end_date = self.get_period_range()
         
-        print(f"📅 조회 기간: {start_date.strftime('%Y년 %m월 %d일')} ~ {end_date.strftime('%Y년 %m월 %d일')}")
-        print()
+        self._log(f"📅 조회 기간: {start_date.strftime('%Y년 %m월 %d일')} ~ {end_date.strftime('%Y년 %m월 %d일')}")
+        self._log("")
+        self._update_progress(0.05, "기간 설정 완료")
         
         # 모든 채널 가져오기
+        self._update_progress(0.10, "채널 목록 수집 중...")
         channels = self.get_all_channels(exclude_archived=True)
         
         if not channels:
-            print("❌ 수집할 채널이 없습니다.")
+            self._log("❌ 수집할 채널이 없습니다.")
             return
         
-        print()
-        print("=" * 80)
-        print("📝 채널별 메시지 수집 시작...")
-        print("=" * 80)
-        print()
+        self._log("")
+        self._log("=" * 80)
+        self._log("📝 채널별 메시지 수집 시작...")
+        self._log("=" * 80)
+        self._log("")
         
         # 담당자별, 주별 메시지 저장
         # 구조: {user_name: {week_num: [{text, timestamp, channel, date, datetime}]}}
@@ -803,7 +829,12 @@ class SlackChannelReporter:
             is_dm = channel.get("is_im") or channel.get("is_mpim")
             
             channel_type = "💬" if is_dm else ("🔒" if is_private else "#")
-            print(f"[{idx}/{total_channels}] {channel_type}{channel_name} 처리 중...", end=" ", flush=True)
+            
+            # 진행률 업데이트 (채널 수집 단계: 10% ~ 60%)
+            channel_progress = 0.10 + (idx / total_channels) * 0.50
+            self._update_progress(channel_progress, f"채널 수집 중 [{idx}/{total_channels}] {channel_type}{channel_name}")
+            
+            self._log(f"[{idx}/{total_channels}] {channel_type}{channel_name} 처리 중...")
             
             # 채널 정보 DB에 저장
             self.save_channel_to_db(channel)
@@ -811,7 +842,7 @@ class SlackChannelReporter:
             messages = self.get_period_messages(channel_id, channel_name, start_date, end_date)
             
             if messages:
-                print(f"✅ {len(messages)}개 메시지 발견")
+                self._log(f"✅ {len(messages)}개 메시지 발견")
                 
                 # 채널 타입 결정 (DB 저장용)
                 db_channel_type = ""
@@ -848,13 +879,14 @@ class SlackChannelReporter:
                             "user_id": user_id  # DB 조회용
                         })
             else:
-                print("메시지 없음")
+                self._log("메시지 없음")
         
-        print()
-        print("=" * 80)
-        print("📊 메시지 수집 완료, GPT 분석 시작...")
-        print("=" * 80)
-        print()
+        self._log("")
+        self._log("=" * 80)
+        self._log("📊 메시지 수집 완료, GPT 분석 시작...")
+        self._log("=" * 80)
+        self._log("")
+        self._update_progress(0.60, "메시지 수집 완료, GPT 분석 준비 중...")
         
         # 담당자별, 주별 GPT 분석 수행
         user_weekly_analysis = defaultdict(dict)
@@ -862,16 +894,19 @@ class SlackChannelReporter:
         total_users = len(user_weekly_messages)
         user_idx = 0
         
+        # 전체 주차 수 계산
+        total_weeks = sum(len(weeks) for weeks in user_weekly_messages.values())
+        analyzed_weeks = 0
+        skipped_weeks = 0
+        
         for user_name, weekly_data in sorted(user_weekly_messages.items()):
             user_idx += 1
-            total_weeks = len(weekly_data)
-            week_idx = 0
+            weeks_in_user = len(weekly_data)
             
-            print(f"[{user_idx}/{total_users}] 👤 {user_name} 분석 중...")
+            self._log(f"[{user_idx}/{total_users}] 👤 {user_name} 분석 중...")
             
             kst = timezone(timedelta(hours=9))
             for week_num in sorted(weekly_data.keys()):
-                week_idx += 1
                 messages = weekly_data[week_num]
                 
                 # 주차 범위 계산 (10/20 기준)
@@ -888,14 +923,27 @@ class SlackChannelReporter:
                 
                 # 중복 체크
                 if user_id and self.check_existing_week(user_id, week_start):
-                    print(f"  → {week_num}주차 ({week_range}, {len(messages)}개 메시지) 이미 분석됨 ⏭️")
+                    skipped_weeks += 1
+                    analyzed_weeks += 1
+                    self._log(f"  → {week_num}주차 ({week_range}, {len(messages)}개 메시지) 이미 분석됨 ⏭️")
+                    
+                    # 진행률 업데이트 (GPT 분석 단계: 60% ~ 95%)
+                    if total_weeks > 0:
+                        analysis_progress = 0.60 + (analyzed_weeks / total_weeks) * 0.35
+                        self._update_progress(analysis_progress, f"GPT 분석 진행 중 [{analyzed_weeks}/{total_weeks}] (스킵: {skipped_weeks})")
                     continue
                 
-                print(f"  → {week_num}주차 ({week_range}, {len(messages)}개 메시지) 분석 중...", end=" ", flush=True)
+                # 진행률 업데이트
+                if total_weeks > 0:
+                    analysis_progress = 0.60 + (analyzed_weeks / total_weeks) * 0.35
+                    self._update_progress(analysis_progress, f"GPT 분석 중 [{analyzed_weeks+1}/{total_weeks}] {user_name} - {week_range}")
+                
+                self._log(f"  → {week_num}주차 ({week_range}, {len(messages)}개 메시지) 분석 중...")
                 
                 analysis = self.analyze_user_work_with_gpt(user_name, week_range, messages)
                 
                 if analysis:
+                    analyzed_weeks += 1
                     user_weekly_analysis[user_name][week_num] = {
                         "analysis": analysis,
                         "message_count": len(messages),
@@ -908,64 +956,33 @@ class SlackChannelReporter:
                     if user_id:
                         self.save_gpt_analysis_to_db(user_id, week_start, week_range, analysis)
                     
-                    print("✅")
+                    self._log("✅")
                 else:
-                    print("⏭️")
+                    analyzed_weeks += 1
+                    self._log("⏭️")
         
-        print()
-        print("=" * 80)
-        print("📋 CEO/관리자용 주간 업무 분석 리포트")
-        print("=" * 80)
-        print()
-        
-        # 담당자별 리포트 출력
-        for user_name in sorted(user_weekly_analysis.keys()):
-            print("\n" + "=" * 80)
-            print(f"👤 담당자: {user_name}")
-            print("=" * 80)
-            
-            for week_num in sorted(user_weekly_analysis[user_name].keys()):
-                data = user_weekly_analysis[user_name][week_num]
-                
-                print(f"\n📅 {week_num}주차 ({data['week_range']})")
-                print(f"   총 {data['message_count']}개 메시지")
-                print("-" * 80)
-                
-                # 주요 채널 및 활동 요약
-                channels_summary = defaultdict(int)
-                for msg in data["messages"][:20]:  # 최근 20개만
-                    channels_summary[msg["channel"]] += 1
-                
-                if channels_summary:
-                    print("   주요 활동 채널:")
-                    for ch, count in sorted(channels_summary.items(), key=lambda x: x[1], reverse=True)[:5]:
-                        print(f"     - {ch}: {count}건")
-                
-                print()
-                print("🤖 GPT 분석 결과:")
-                print("-" * 80)
-                print(data["analysis"])
-                print()
+        self._update_progress(0.95, "분석 완료, 리포트 생성 중...")
+        self._log("")
+        self._log("=" * 80)
+        self._log("📋 CEO/관리자용 주간 업무 분석 리포트")
+        self._log("=" * 80)
+        self._log("")
         
         # 전체 요약 통계
-        print()
-        print("=" * 80)
-        print("📊 전체 요약 통계")
-        print("=" * 80)
-        
         total_messages = sum(
             sum(data["message_count"] for data in user_data.values())
             for user_data in user_weekly_analysis.values()
         )
         
-        print(f"분석된 담당자 수: {len(user_weekly_analysis)}명")
-        print(f"총 메시지 수: {total_messages}개")
-        print(f"분석 기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
-        
-        print()
-        print("=" * 80)
-        print("✅ 리포트 생성 완료")
-        print("=" * 80)
+        self._log(f"분석된 담당자 수: {len(user_weekly_analysis)}명")
+        self._log(f"총 메시지 수: {total_messages}개")
+        self._log(f"분석 기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
+        self._log(f"스킵된 주차: {skipped_weeks}개")
+        self._log("")
+        self._log("=" * 80)
+        self._log("✅ 리포트 생성 완료")
+        self._log("=" * 80)
+        self._update_progress(1.0, "✅ 완료!")
 
 
 def main():
