@@ -72,28 +72,84 @@ def login_page():
 
 def get_reporter() -> Optional[SlackChannelReporter]:
     """SlackChannelReporter 인스턴스 생성"""
+    import traceback
+    
     try:
+        st.info("🔍 [디버그] 리포터 생성 시작...")
+        
+        # 1. Secrets 확인
+        st.info("🔍 [디버그] Step 1: Secrets 로드 중...")
         user_token = st.secrets.get("SLACK_USER_TOKEN")
         openai_api_key = st.secrets.get("OPENAI_API_KEY")
         db_connection_string = st.secrets.get("DB_CONNECTION_STRING")
+        
+        st.info(f"🔍 [디버그] - SLACK_USER_TOKEN: {'✅ 설정됨' if user_token else '❌ 없음'}")
+        st.info(f"🔍 [디버그] - OPENAI_API_KEY: {'✅ 설정됨' if openai_api_key else '⚠️ 없음'}")
+        st.info(f"🔍 [디버그] - DB_CONNECTION_STRING: {'✅ 설정됨' if db_connection_string else '⚠️ 없음'}")
         
         if not user_token:
             st.error("❌ SLACK_USER_TOKEN이 설정되지 않았습니다.")
             return None
         
-        return SlackChannelReporter(
-            user_token=user_token,
-            openai_api_key=openai_api_key,
-            db_connection_string=db_connection_string
-        )
+        # 2. SlackChannelReporter 인스턴스 생성 시도
+        st.info("🔍 [디버그] Step 2: SlackChannelReporter 인스턴스 생성 중...")
+        
+        try:
+            st.info("🔍 [디버그] SlackChannelReporter 클래스 호출 직전...")
+            reporter = SlackChannelReporter(
+                user_token=user_token,
+                openai_api_key=openai_api_key,
+                db_connection_string=db_connection_string
+            )
+            st.info("🔍 [디버그] Step 3: 리포터 객체 생성 완료!")
+            
+            # 속성 존재 확인 (여러 방법으로)
+            st.info(f"🔍 [디버그] - hasattr(log_callback): {hasattr(reporter, 'log_callback')}")
+            st.info(f"🔍 [디버그] - hasattr(progress_callback): {hasattr(reporter, 'progress_callback')}")
+            
+            # 직접 접근 시도
+            try:
+                lc = reporter.log_callback
+                st.info(f"🔍 [디버그] - log_callback 직접 접근 성공: {type(lc)}")
+            except AttributeError as attr_e:
+                st.error(f"❌ [직접접근실패] log_callback 접근 시 AttributeError: {attr_e}")
+                st.error(f"🔍 [디버그] reporter 객체 속성 목록:")
+                st.code("\n".join([x for x in dir(reporter) if not x.startswith('_')]), language='text')
+                return None
+            
+            # getattr로 접근 시도
+            lc_getattr = getattr(reporter, 'log_callback', 'NOT_FOUND')
+            st.info(f"🔍 [디버그] - getattr(log_callback): {lc_getattr}")
+            
+            if hasattr(reporter, 'log_callback'):
+                st.info(f"🔍 [디버그] - log_callback 값: {reporter.log_callback}")
+            
+            return reporter
+        except AttributeError as ae:
+            st.error(f"❌ [AttributeError] 속성 오류 발생: {ae}")
+            st.error(f"🔍 [디버그] 오류 발생 위치: {traceback.format_exc()}")
+            st.code(traceback.format_exc(), language='python')
+            return None
+        except Exception as init_e:
+            st.error(f"❌ [InitError] 초기화 중 오류: {init_e}")
+            st.error(f"🔍 [디버그] 오류 타입: {type(init_e).__name__}")
+            st.error(f"🔍 [디버그] 전체 스택 트레이스:")
+            st.code(traceback.format_exc(), language='python')
+            return None
+            
     except Exception as e:
-        st.error(f"❌ 리포터 초기화 오류: {e}")
+        st.error(f"❌ [GeneralError] 예상치 못한 오류: {e}")
+        st.error(f"🔍 [디버그] 오류 타입: {type(e).__name__}")
+        st.error(f"🔍 [디버그] 전체 스택 트레이스:")
+        st.code(traceback.format_exc(), language='python')
         return None
 
 
 def load_analyses_from_db(reporter: SlackChannelReporter) -> Dict[str, Dict]:
     """DB에서 분석 결과 로드"""
-    if not reporter or not reporter.db_conn:
+    if not reporter:
+        return {}
+    if not hasattr(reporter, 'db_conn') or not reporter.db_conn:
         return {}
     
     try:
@@ -156,14 +212,19 @@ def main_dashboard():
                 db_status_container = st.container()
                 
                 with db_status_container:
-                    if reporter.db_conn:
-                        st.success(f"✅ 연결 성공: {reporter.db_connection_status}")
-                        if reporter.db_connection_type:
-                            st.info(f"연결 타입: {reporter.db_connection_type}")
+                    # 안전하게 속성 확인
+                    db_conn = getattr(reporter, 'db_conn', None)
+                    db_status = getattr(reporter, 'db_connection_status', '알 수 없음')
+                    db_type = getattr(reporter, 'db_connection_type', None)
+                    
+                    if db_conn:
+                        st.success(f"✅ 연결 성공: {db_status}")
+                        if db_type:
+                            st.info(f"연결 타입: {db_type}")
                         
                         # 테이블 존재 여부 확인
                         try:
-                            cursor = reporter.db_conn.cursor()
+                            cursor = db_conn.cursor()
                             cursor.execute("""
                                 SELECT table_name 
                                 FROM information_schema.tables 
@@ -184,7 +245,7 @@ def main_dashboard():
                         except Exception as e:
                             st.warning(f"⚠️ 테이블 확인 실패: {str(e)[:100]}")
                     else:
-                        st.error(f"❌ 연결 실패: {reporter.db_connection_status}")
+                        st.error(f"❌ 연결 실패: {db_status}")
                 
                 st.markdown("---")
                 
@@ -214,7 +275,17 @@ def main_dashboard():
                     if len(log_messages) > 200:
                         log_messages.pop(0)
                 
-                # 콜백 함수 설정
+                # 콜백 함수 설정 (안전하게 속성 확인 후 설정)
+                if not hasattr(reporter, 'progress_callback'):
+                    st.error("❌ reporter.progress_callback 속성이 없습니다!")
+                    st.session_state['analysis_running'] = False
+                    return
+                if not hasattr(reporter, 'log_callback'):
+                    st.error("❌ reporter.log_callback 속성이 없습니다!")
+                    st.error(f"🔍 reporter 객체 속성: {[x for x in dir(reporter) if not x.startswith('_')]}")
+                    st.session_state['analysis_running'] = False
+                    return
+                
                 reporter.progress_callback = update_progress
                 reporter.log_callback = log_message
                 
@@ -269,20 +340,25 @@ def main_dashboard():
                                     key="full_logs"
                                 )
                             
-                            # DB 통계 표시
+                            # DB 통계 표시 (안전하게 속성 확인)
                             st.markdown("---")
                             st.subheader("📊 DB 저장 통계")
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.metric("메시지 저장", f"{reporter.db_stats['messages_saved']}개", 
-                                         delta=f"-{reporter.db_stats['messages_failed']}개 실패" if reporter.db_stats['messages_failed'] > 0 else None)
-                                st.metric("채널 저장", f"{reporter.db_stats['channels_saved']}개",
-                                         delta=f"-{reporter.db_stats['channels_failed']}개 실패" if reporter.db_stats['channels_failed'] > 0 else None)
-                            with col2:
-                                st.metric("사용자 저장", f"{reporter.db_stats['users_saved']}개",
-                                         delta=f"-{reporter.db_stats['users_failed']}개 실패" if reporter.db_stats['users_failed'] > 0 else None)
-                                st.metric("GPT 분석 저장", f"{reporter.db_stats['analyses_saved']}개",
-                                         delta=f"-{reporter.db_stats['analyses_failed']}개 실패" if reporter.db_stats['analyses_failed'] > 0 else None)
+                            
+                            if hasattr(reporter, 'db_stats'):
+                                db_stats = reporter.db_stats
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("메시지 저장", f"{db_stats.get('messages_saved', 0)}개", 
+                                             delta=f"-{db_stats.get('messages_failed', 0)}개 실패" if db_stats.get('messages_failed', 0) > 0 else None)
+                                    st.metric("채널 저장", f"{db_stats.get('channels_saved', 0)}개",
+                                             delta=f"-{db_stats.get('channels_failed', 0)}개 실패" if db_stats.get('channels_failed', 0) > 0 else None)
+                                with col2:
+                                    st.metric("사용자 저장", f"{db_stats.get('users_saved', 0)}개",
+                                             delta=f"-{db_stats.get('users_failed', 0)}개 실패" if db_stats.get('users_failed', 0) > 0 else None)
+                                    st.metric("GPT 분석 저장", f"{db_stats.get('analyses_saved', 0)}개",
+                                             delta=f"-{db_stats.get('analyses_failed', 0)}개 실패" if db_stats.get('analyses_failed', 0) > 0 else None)
+                            else:
+                                st.warning("⚠️ DB 통계 정보를 가져올 수 없습니다.")
                     else:
                         log_placeholder.warning("⚠️ 로그 메시지가 수집되지 않았습니다. 콜백이 제대로 작동하지 않았을 수 있습니다.")
                     

@@ -52,6 +52,16 @@ URL_RE = re.compile(r"<(https?://[^|>]+)(?:\|[^>]+)?>")
 
 
 class SlackChannelReporter:
+    def __getattr__(self, name):
+        """속성이 없을 때 호출되는 메서드 - 안전성 강화"""
+        # log_callback과 progress_callback은 반드시 None 반환
+        if name in ['log_callback', 'progress_callback']:
+            print(f"[WARNING] {name}이 없어서 None 반환 (이것은 비정상적입니다!)")
+            print(f"[WARNING] 현재 객체 속성: {[x for x in dir(self) if not x.startswith('_')]}")
+            return None
+        # 다른 속성은 일반적인 AttributeError
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+    
     def __init__(self, user_token: str = None, openai_api_key: str = None, db_connection_string: str = None):
         """
         Slack 채널 리포트 생성기 초기화
@@ -61,106 +71,19 @@ class SlackChannelReporter:
             openai_api_key: OpenAI API Key. 환경 변수에서 자동 로드 가능
             db_connection_string: Supabase DB 연결 문자열. 환경 변수에서 자동 로드 가능
         """
-        self.user_token = user_token or os.getenv("SLACK_USER_TOKEN")
-        if not self.user_token:
-            raise ValueError("SLACK_USER_TOKEN 환경 변수가 설정되지 않았습니다.")
+        import traceback
         
-        self.headers = {
-            "Authorization": f"Bearer {self.user_token}"
-        }
-        
-        # OpenAI 클라이언트 초기화
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        if self.openai_api_key and OPENAI_AVAILABLE:
-            self.client = OpenAI(api_key=self.openai_api_key)
-            self.use_gpt = True
-        else:
-            self.client = None
-            self.use_gpt = False
-            if not OPENAI_AVAILABLE:
-                print("⚠️ OpenAI 라이브러리를 사용할 수 없습니다. GPT 분석이 비활성화됩니다.")
-            else:
-                print("⚠️ OPENAI_API_KEY가 설정되지 않았습니다. GPT 분석이 비활성화됩니다.")
-        
-        # Supabase/PostgreSQL 연결 초기화
-        self.db_conn_string = db_connection_string or os.getenv("DB_CONNECTION_STRING")
-        self.db_conn = None
-        self.db_connection_status = "미연결"
-        self.db_connection_type = None
-        
-        if self.db_conn_string and SUPABASE_AVAILABLE:
-            self._log("🔌 Supabase 연결 시도 중...")
-            self._log(f"   연결 문자열: {self.db_conn_string[:60]}...")
-            # Direct connection 시도
-            try:
-                self.db_conn = connect(self.db_conn_string)
-                # 연결 테스트
-                cursor = self.db_conn.cursor()
-                cursor.execute("SELECT version();")
-                version = cursor.fetchone()[0]
-                cursor.close()
-                self.db_connection_status = "연결 성공"
-                self.db_connection_type = "Direct (포트 5432)"
-                self._log("✅ Supabase 연결 성공 (Direct connection)")
-                self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
-            except Exception as e:
-                error_msg = str(e).lower()
-                # IPv4/DNS 문제인 경우 Session Pooler로 재시도
-                if "could not translate host name" in error_msg or "name or service not known" in error_msg:
-                    self._log(f"⚠️ Direct connection 실패 (IPv4/DNS 문제): {e}")
-                    self._log("🔄 Session Pooler로 재시도 중...")
-                    
-                    # Session Pooler 연결 문자열 생성 (포트 6543)
-                    pooler_string = None
-                    if ":5432/" in self.db_conn_string:
-                        pooler_string = self.db_conn_string.replace(":5432/", ":6543/postgres")
-                    elif ":5432" in self.db_conn_string:
-                        pooler_string = self.db_conn_string.replace(":5432", ":6543")
-                    
-                    if pooler_string:
-                        try:
-                            self.db_conn = connect(pooler_string)
-                            # 연결 테스트
-                            cursor = self.db_conn.cursor()
-                            cursor.execute("SELECT version();")
-                            version = cursor.fetchone()[0]
-                            cursor.close()
-                            self.db_connection_status = "연결 성공"
-                            self.db_connection_type = "Session Pooler (포트 6543)"
-                            self._log("✅ Supabase 연결 성공 (Session Pooler)")
-                            self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
-                            self.db_conn_string = pooler_string  # 나중에 사용하기 위해 저장
-                        except Exception as e2:
-                            self.db_connection_status = f"연결 실패: {str(e2)[:100]}"
-                            self._log(f"❌ Session Pooler 연결도 실패: {e2}")
-                            self._log("💡 Supabase 대시보드에서 Session Pooler 연결 문자열을 직접 확인하세요.")
-                            self.db_conn = None
-                    else:
-                        self.db_connection_status = "Session Pooler 문자열 생성 실패"
-                        self._log("💡 Session Pooler 연결 문자열을 수동으로 설정하세요:")
-                        self._log("   포트를 6543으로 변경: postgresql://...@host:6543/postgres")
-                        self.db_conn = None
-                else:
-                    self.db_connection_status = f"연결 실패: {str(e)[:100]}"
-                    self._log(f"❌ Supabase 연결 실패: {e}")
-                    self.db_conn = None
-        else:
-            if not SUPABASE_AVAILABLE:
-                self.db_connection_status = "라이브러리 없음"
-                self._log("⚠️ Supabase 라이브러리를 사용할 수 없습니다. DB 저장이 비활성화됩니다.")
-            else:
-                self.db_connection_status = "연결 문자열 없음"
-                self._log("⚠️ DB_CONNECTION_STRING이 설정되지 않았습니다. DB 저장이 비활성화됩니다.")
-        
-        # 사용자 정보 캐시 (user_id -> 이름)
+        # ⚠️ 필수 속성 먼저 초기화 (예외 발생 시에도 보장)
+        # 이 속성들은 반드시 존재해야 하므로 try 블록 밖에서 초기화
+        self.progress_callback = None
+        self.log_callback = None
+        self.user_token = None
+        self.headers = {}
+        self.client = None
+        self.use_gpt = False
+        self.openai_api_key = None
         self.user_cache = {}
-        # user_id -> user_name 매핑 (DB용)
         self.user_id_to_name = {}
-        # Streamlit 진행률 콜백 함수들
-        self.progress_callback = None  # 진행률 업데이트 콜백 (progress_value, status_text)
-        self.log_callback = None  # 로그 출력 콜백 (message)
-        
-        # DB 저장 통계
         self.db_stats = {
             'messages_saved': 0,
             'messages_failed': 0,
@@ -171,6 +94,157 @@ class SlackChannelReporter:
             'analyses_saved': 0,
             'analyses_failed': 0
         }
+        self.db_conn_string = None
+        self.db_conn = None
+        self.db_connection_status = "미연결"
+        self.db_connection_type = None
+        
+        print(f"[DEBUG] __init__ 필수 속성 사전 초기화 완료")
+        print(f"[DEBUG] hasattr(log_callback)={hasattr(self, 'log_callback')}")
+        print(f"[DEBUG] hasattr(progress_callback)={hasattr(self, 'progress_callback')}")
+        
+        # 강제로 속성 존재 확인 및 검증
+        assert hasattr(self, 'log_callback'), "log_callback이 초기화되지 않았습니다!"
+        assert hasattr(self, 'progress_callback'), "progress_callback이 초기화되지 않았습니다!"
+        print(f"[DEBUG] 속성 검증 통과: log_callback={type(self.log_callback)}, progress_callback={type(self.progress_callback)}")
+        
+        try:
+            # Step 1: 콜백 함수들 (이미 초기화됨, 확인만)
+            print(f"[DEBUG] __init__ Step 1: 콜백 함수 확인")
+            print(f"[DEBUG] __init__ Step 1: log_callback={self.log_callback}, progress_callback={self.progress_callback}")
+            
+            # Step 2: User token 초기화
+            print(f"[DEBUG] __init__ Step 2: User token 초기화 시작")
+            self.user_token = user_token or os.getenv("SLACK_USER_TOKEN")
+            if not self.user_token:
+                raise ValueError("SLACK_USER_TOKEN 환경 변수가 설정되지 않았습니다.")
+            
+            self.headers = {
+                "Authorization": f"Bearer {self.user_token}"
+            }
+            
+            # OpenAI 클라이언트 초기화
+            print(f"[DEBUG] __init__ Step 3: OpenAI 클라이언트 초기화 시작")
+            self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+            if self.openai_api_key and OPENAI_AVAILABLE:
+                self.client = OpenAI(api_key=self.openai_api_key)
+                self.use_gpt = True
+            else:
+                self.client = None
+                self.use_gpt = False
+                if not OPENAI_AVAILABLE:
+                    print("⚠️ OpenAI 라이브러리를 사용할 수 없습니다. GPT 분석이 비활성화됩니다.")
+                else:
+                    print("⚠️ OPENAI_API_KEY가 설정되지 않았습니다. GPT 분석이 비활성화됩니다.")
+            
+            # Step 4: 캐시 및 통계 (이미 초기화됨, 확인만)
+            print(f"[DEBUG] __init__ Step 4: 캐시 및 통계 확인")
+            
+            # Step 5: Supabase/PostgreSQL 연결 초기화
+            print(f"[DEBUG] __init__ Step 5: Supabase 연결 초기화 시작")
+            self.db_conn_string = db_connection_string or os.getenv("DB_CONNECTION_STRING")
+            
+            if self.db_conn_string and SUPABASE_AVAILABLE:
+                # 디버그: _log 호출 전 확인
+                print(f"[DEBUG] DB 연결 시작 전: hasattr(log_callback)={hasattr(self, 'log_callback')}")
+                print(f"[DEBUG] DB 연결 시작 전: log_callback 값={getattr(self, 'log_callback', 'NOT_EXISTS')}")
+                try:
+                    self._log("🔌 Supabase 연결 시도 중...")
+                    self._log(f"   연결 문자열: {self.db_conn_string[:60]}...")
+                except AttributeError as log_err:
+                    print(f"[DEBUG] ❌ _log 호출 시 AttributeError 발생: {log_err}")
+                    print(f"[DEBUG] 현재 객체 속성: {dir(self)}")
+                    raise
+                # Direct connection 시도
+                try:
+                    self.db_conn = connect(self.db_conn_string)
+                    # 연결 테스트
+                    cursor = self.db_conn.cursor()
+                    cursor.execute("SELECT version();")
+                    version = cursor.fetchone()[0]
+                    cursor.close()
+                    self.db_connection_status = "연결 성공"
+                    self.db_connection_type = "Direct (포트 5432)"
+                    self._log("✅ Supabase 연결 성공 (Direct connection)")
+                    self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    # IPv4/DNS 문제인 경우 Session Pooler로 재시도
+                    if "could not translate host name" in error_msg or "name or service not known" in error_msg:
+                        self._log(f"⚠️ Direct connection 실패 (IPv4/DNS 문제): {e}")
+                        self._log("🔄 Session Pooler로 재시도 중...")
+                        
+                        # Session Pooler 연결 문자열 생성 (포트 6543)
+                        pooler_string = None
+                        if ":5432/" in self.db_conn_string:
+                            pooler_string = self.db_conn_string.replace(":5432/", ":6543/postgres")
+                        elif ":5432" in self.db_conn_string:
+                            pooler_string = self.db_conn_string.replace(":5432", ":6543")
+                        
+                        if pooler_string:
+                            try:
+                                self.db_conn = connect(pooler_string)
+                                # 연결 테스트
+                                cursor = self.db_conn.cursor()
+                                cursor.execute("SELECT version();")
+                                version = cursor.fetchone()[0]
+                                cursor.close()
+                                self.db_connection_status = "연결 성공"
+                                self.db_connection_type = "Session Pooler (포트 6543)"
+                                self._log("✅ Supabase 연결 성공 (Session Pooler)")
+                                self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
+                                self.db_conn_string = pooler_string  # 나중에 사용하기 위해 저장
+                            except Exception as e2:
+                                self.db_connection_status = f"연결 실패: {str(e2)[:100]}"
+                                self._log(f"❌ Session Pooler 연결도 실패: {e2}")
+                                self._log("💡 Supabase 대시보드에서 Session Pooler 연결 문자열을 직접 확인하세요.")
+                                self.db_conn = None
+                        else:
+                            self.db_connection_status = "Session Pooler 문자열 생성 실패"
+                            self._log("💡 Session Pooler 연결 문자열을 수동으로 설정하세요:")
+                            self._log("   포트를 6543으로 변경: postgresql://...@host:6543/postgres")
+                            self.db_conn = None
+                    else:
+                        self.db_connection_status = f"연결 실패: {str(e)[:100]}"
+                        self._log(f"❌ Supabase 연결 실패: {e}")
+                        self.db_conn = None
+            else:
+                if not SUPABASE_AVAILABLE:
+                    self.db_connection_status = "라이브러리 없음"
+                    print(f"[DEBUG] SUPABASE_AVAILABLE=False, _log 호출 전")
+                    print(f"[DEBUG] hasattr(log_callback)={hasattr(self, 'log_callback')}")
+                    try:
+                        self._log("⚠️ Supabase 라이브러리를 사용할 수 없습니다. DB 저장이 비활성화됩니다.")
+                    except AttributeError as log_err:
+                        print(f"[DEBUG] ❌ _log 호출 시 AttributeError: {log_err}")
+                        print(f"[DEBUG] 현재 객체 속성: {dir(self)}")
+                        raise
+                else:
+                    self.db_connection_status = "연결 문자열 없음"
+                    print(f"[DEBUG] DB_CONNECTION_STRING 없음, _log 호출 전")
+                    print(f"[DEBUG] hasattr(log_callback)={hasattr(self, 'log_callback')}")
+                    try:
+                        self._log("⚠️ DB_CONNECTION_STRING이 설정되지 않았습니다. DB 저장이 비활성화됩니다.")
+                    except AttributeError as log_err:
+                        print(f"[DEBUG] ❌ _log 호출 시 AttributeError: {log_err}")
+                        print(f"[DEBUG] 현재 객체 속성: {dir(self)}")
+                        raise
+            
+            print(f"[DEBUG] __init__ 완료!")
+        
+        except AttributeError as attr_err:
+            print(f"[DEBUG] ❌ __init__ 중 AttributeError 발생: {attr_err}")
+            print(f"[DEBUG] 현재 객체 속성 목록: {dir(self)}")
+            print(f"[DEBUG] 전체 스택 트레이스:")
+            import traceback
+            traceback.print_exc()
+            raise
+        except Exception as init_err:
+            print(f"[DEBUG] ❌ __init__ 중 예외 발생: {init_err}")
+            print(f"[DEBUG] 오류 타입: {type(init_err).__name__}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     def _slack_get(self, url: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Optional[requests.Response]:
         """
@@ -846,13 +920,25 @@ class SlackChannelReporter:
             return None
     
     def _log(self, message: str):
-        """로그 출력 (Streamlit 또는 print)"""
-        if self.log_callback:
-            self.log_callback(message)
-            # Streamlit인 경우에만 UI 업데이트를 위한 대기 (콜백이 Streamlit인지 확인)
-            # 터미널에서는 sleep이 필요 없으므로 제거
-        else:
-            print(message)
+        """로그 출력 (Streamlit 또는 print) - 완전히 안전한 버전"""
+        # 가장 안전한 방법: getattr 사용
+        try:
+            log_callback = getattr(self, 'log_callback', None)
+            if log_callback is not None:
+                try:
+                    log_callback(message)
+                    return
+                except Exception as e:
+                    # 콜백 호출 실패 시 print로 대체
+                    print(f"[콜백 오류] {message}")
+                    print(f"  오류: {e}")
+                    return
+        except Exception as getattr_err:
+            # getattr 자체가 실패한 경우 (매우 드묾)
+            print(f"[DEBUG _log] ⚠️ getattr 실패: {getattr_err}")
+        
+        # 기본: print로 출력
+        print(message)
     
     def _update_progress(self, progress: float, status: str):
         """진행률 업데이트 (Streamlit 또는 무시)"""
