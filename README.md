@@ -39,6 +39,23 @@ LOGIN_PASSWORD = "your-password"
 streamlit run app.py
 ```
 
+### 터미널 테스트 실행
+
+터미널에서 직접 실행하여 진행률과 로그를 확인할 수 있습니다:
+
+```bash
+# Windows PowerShell
+$env:SLACK_USER_TOKEN="xoxp-your-token"
+$env:OPENAI_API_KEY="sk-your-api-key"
+$env:DB_CONNECTION_STRING="postgresql://postgres:password@host:5432/postgres"
+python test_analysis.py
+```
+
+터미널에서 실행하면:
+- 진행률 바가 실시간으로 표시됩니다
+- 모든 로그 메시지가 터미널에 출력됩니다
+- 소요 시간이 표시됩니다
+
 ## Streamlit Cloud 배포
 
 1. [Streamlit Cloud](https://streamlit.io/cloud)에 접속하여 GitHub 저장소를 연결

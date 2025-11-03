@@ -85,17 +85,30 @@ class SlackChannelReporter:
         # Supabase/PostgreSQL 연결 초기화
         self.db_conn_string = db_connection_string or os.getenv("DB_CONNECTION_STRING")
         self.db_conn = None
+        self.db_connection_status = "미연결"
+        self.db_connection_type = None
+        
         if self.db_conn_string and SUPABASE_AVAILABLE:
+            self._log("🔌 Supabase 연결 시도 중...")
+            self._log(f"   연결 문자열: {self.db_conn_string[:60]}...")
             # Direct connection 시도
             try:
                 self.db_conn = connect(self.db_conn_string)
-                print("✅ Supabase 연결 성공 (Direct connection)")
+                # 연결 테스트
+                cursor = self.db_conn.cursor()
+                cursor.execute("SELECT version();")
+                version = cursor.fetchone()[0]
+                cursor.close()
+                self.db_connection_status = "연결 성공"
+                self.db_connection_type = "Direct (포트 5432)"
+                self._log("✅ Supabase 연결 성공 (Direct connection)")
+                self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
             except Exception as e:
                 error_msg = str(e).lower()
                 # IPv4/DNS 문제인 경우 Session Pooler로 재시도
                 if "could not translate host name" in error_msg or "name or service not known" in error_msg:
-                    print(f"⚠️ Direct connection 실패 (IPv4/DNS 문제): {e}")
-                    print("🔄 Session Pooler로 재시도 중...")
+                    self._log(f"⚠️ Direct connection 실패 (IPv4/DNS 문제): {e}")
+                    self._log("🔄 Session Pooler로 재시도 중...")
                     
                     # Session Pooler 연결 문자열 생성 (포트 6543)
                     pooler_string = None
@@ -107,24 +120,37 @@ class SlackChannelReporter:
                     if pooler_string:
                         try:
                             self.db_conn = connect(pooler_string)
-                            print("✅ Supabase 연결 성공 (Session Pooler)")
+                            # 연결 테스트
+                            cursor = self.db_conn.cursor()
+                            cursor.execute("SELECT version();")
+                            version = cursor.fetchone()[0]
+                            cursor.close()
+                            self.db_connection_status = "연결 성공"
+                            self.db_connection_type = "Session Pooler (포트 6543)"
+                            self._log("✅ Supabase 연결 성공 (Session Pooler)")
+                            self._log(f"   PostgreSQL 버전: {version.split(',')[0]}")
                             self.db_conn_string = pooler_string  # 나중에 사용하기 위해 저장
                         except Exception as e2:
-                            print(f"⚠️ Session Pooler 연결도 실패: {e2}")
-                            print("💡 Supabase 대시보드에서 Session Pooler 연결 문자열을 직접 확인하세요.")
+                            self.db_connection_status = f"연결 실패: {str(e2)[:100]}"
+                            self._log(f"❌ Session Pooler 연결도 실패: {e2}")
+                            self._log("💡 Supabase 대시보드에서 Session Pooler 연결 문자열을 직접 확인하세요.")
                             self.db_conn = None
                     else:
-                        print("💡 Session Pooler 연결 문자열을 수동으로 설정하세요:")
-                        print("   포트를 6543으로 변경: postgresql://...@host:6543/postgres")
+                        self.db_connection_status = "Session Pooler 문자열 생성 실패"
+                        self._log("💡 Session Pooler 연결 문자열을 수동으로 설정하세요:")
+                        self._log("   포트를 6543으로 변경: postgresql://...@host:6543/postgres")
                         self.db_conn = None
                 else:
-                    print(f"⚠️ Supabase 연결 실패: {e}")
+                    self.db_connection_status = f"연결 실패: {str(e)[:100]}"
+                    self._log(f"❌ Supabase 연결 실패: {e}")
                     self.db_conn = None
         else:
             if not SUPABASE_AVAILABLE:
-                print("⚠️ Supabase 라이브러리를 사용할 수 없습니다. DB 저장이 비활성화됩니다.")
+                self.db_connection_status = "라이브러리 없음"
+                self._log("⚠️ Supabase 라이브러리를 사용할 수 없습니다. DB 저장이 비활성화됩니다.")
             else:
-                print("⚠️ DB_CONNECTION_STRING이 설정되지 않았습니다. DB 저장이 비활성화됩니다.")
+                self.db_connection_status = "연결 문자열 없음"
+                self._log("⚠️ DB_CONNECTION_STRING이 설정되지 않았습니다. DB 저장이 비활성화됩니다.")
         
         # 사용자 정보 캐시 (user_id -> 이름)
         self.user_cache = {}
@@ -133,6 +159,18 @@ class SlackChannelReporter:
         # Streamlit 진행률 콜백 함수들
         self.progress_callback = None  # 진행률 업데이트 콜백 (progress_value, status_text)
         self.log_callback = None  # 로그 출력 콜백 (message)
+        
+        # DB 저장 통계
+        self.db_stats = {
+            'messages_saved': 0,
+            'messages_failed': 0,
+            'channels_saved': 0,
+            'channels_failed': 0,
+            'users_saved': 0,
+            'users_failed': 0,
+            'analyses_saved': 0,
+            'analyses_failed': 0
+        }
     
     def _slack_get(self, url: str, params: Dict[str, Any] = None, max_retries: int = 3) -> Optional[requests.Response]:
         """
@@ -237,7 +275,7 @@ class SlackChannelReporter:
             cursor.close()
             return count > 0
         except Exception as e:
-            print(f"⚠️ DB 조회 오류: {e}")
+            self._log(f"⚠️ [DB] 주차 확인 조회 오류: {str(e)[:200]}")
             return False
     
     def save_message_to_db(self, msg: Dict[str, Any], channel_id: str, channel_type: str):
@@ -250,7 +288,7 @@ class SlackChannelReporter:
             channel_type: 채널 타입
         """
         if not self.db_conn:
-            return
+            return False
         
         try:
             msg_uid = f"{channel_id}_{msg['ts']}"
@@ -269,12 +307,19 @@ class SlackChannelReporter:
                    ON CONFLICT (msg_uid) DO NOTHING""",
                 (msg_uid, channel_id, thread_ts, ts, user_id, text, edited_ts, content_hash, channel_type, json_raw)
             )
+            rows_inserted = cursor.rowcount
             self.db_conn.commit()
             cursor.close()
+            
+            if rows_inserted > 0:
+                self.db_stats['messages_saved'] += 1
+            return True
         except Exception as e:
-            print(f"⚠️ 메시지 저장 오류: {e}")
+            self.db_stats['messages_failed'] += 1
+            self._log(f"⚠️ [DB] 메시지 저장 오류 ({msg_uid[:30]}...): {str(e)[:200]}")
             if self.db_conn:
                 self.db_conn.rollback()
+            return False
     
     def save_channel_to_db(self, channel: Dict[str, Any]):
         """
@@ -284,7 +329,7 @@ class SlackChannelReporter:
             channel: 채널 딕셔너리
         """
         if not self.db_conn:
-            return
+            return False
         
         try:
             channel_id = channel.get("id")
@@ -310,10 +355,14 @@ class SlackChannelReporter:
             )
             self.db_conn.commit()
             cursor.close()
+            self.db_stats['channels_saved'] += 1
+            return True
         except Exception as e:
-            print(f"⚠️ 채널 저장 오류: {e}")
+            self.db_stats['channels_failed'] += 1
+            self._log(f"⚠️ [DB] 채널 저장 오류 ({channel_id}): {str(e)[:200]}")
             if self.db_conn:
                 self.db_conn.rollback()
+            return False
     
     def save_user_to_db(self, user_id: str, user_data: Dict[str, Any]):
         """
@@ -324,7 +373,7 @@ class SlackChannelReporter:
             user_data: 사용자 정보 딕셔너리
         """
         if not self.db_conn:
-            return
+            return False
         
         try:
             real_name = user_data.get("real_name") or user_data.get("name", "")
@@ -339,10 +388,14 @@ class SlackChannelReporter:
             )
             self.db_conn.commit()
             cursor.close()
+            self.db_stats['users_saved'] += 1
+            return True
         except Exception as e:
-            print(f"⚠️ 사용자 저장 오류: {e}")
+            self.db_stats['users_failed'] += 1
+            self._log(f"⚠️ [DB] 사용자 저장 오류 ({user_id}): {str(e)[:200]}")
             if self.db_conn:
                 self.db_conn.rollback()
+            return False
     
     def save_gpt_analysis_to_db(self, user_id: str, week_start: datetime, week_range: str, analysis_text: str):
         """
@@ -355,7 +408,8 @@ class SlackChannelReporter:
             analysis_text: 분석 결과 텍스트
         """
         if not self.db_conn:
-            return
+            self._log("⚠️ [DB] GPT 분석 저장 실패: DB 연결 없음")
+            return False
         
         try:
             cursor = self.db_conn.cursor()
@@ -367,10 +421,15 @@ class SlackChannelReporter:
             )
             self.db_conn.commit()
             cursor.close()
+            self.db_stats['analyses_saved'] += 1
+            self._log(f"✅ [DB] GPT 분석 저장 성공: user_id={user_id}, week={week_range}")
+            return True
         except Exception as e:
-            print(f"⚠️ GPT 분석 저장 오류: {e}")
+            self.db_stats['analyses_failed'] += 1
+            self._log(f"❌ [DB] GPT 분석 저장 오류 (user_id={user_id}, week={week_range}): {str(e)[:200]}")
             if self.db_conn:
                 self.db_conn.rollback()
+            return False
     
     def get_user_info(self, user_id: str) -> str:
         """
@@ -1007,6 +1066,27 @@ class SlackChannelReporter:
         self._log(f"총 메시지 수: {total_messages}개")
         self._log(f"분석 기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
         self._log(f"스킵된 주차: {skipped_weeks}개")
+        self._log("")
+        
+        # DB 저장 통계
+        self._log("=" * 80)
+        self._log("📊 DB 저장 통계")
+        self._log("=" * 80)
+        self._log(f"연결 상태: {self.db_connection_status}")
+        if self.db_connection_type:
+            self._log(f"연결 타입: {self.db_connection_type}")
+        self._log("")
+        self._log("저장 성공:")
+        self._log(f"  - 메시지: {self.db_stats['messages_saved']}개")
+        self._log(f"  - 채널: {self.db_stats['channels_saved']}개")
+        self._log(f"  - 사용자: {self.db_stats['users_saved']}개")
+        self._log(f"  - GPT 분석: {self.db_stats['analyses_saved']}개")
+        self._log("")
+        self._log("저장 실패:")
+        self._log(f"  - 메시지: {self.db_stats['messages_failed']}개")
+        self._log(f"  - 채널: {self.db_stats['channels_failed']}개")
+        self._log(f"  - 사용자: {self.db_stats['users_failed']}개")
+        self._log(f"  - GPT 분석: {self.db_stats['analyses_failed']}개")
         self._log("")
         self._log("=" * 80)
         self._log("✅ 리포트 생성 완료")

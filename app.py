@@ -6,6 +6,7 @@ Slack 채널별 담당자 메시지 분석 리포트를 CEO 친화적 UI로 표�
 
 import streamlit as st
 import os
+import time
 from datetime import datetime, timedelta, timezone
 import json
 from channel_report import SlackChannelReporter
@@ -134,20 +135,189 @@ def main_dashboard():
         st.header("⚙️ 설정")
         
         if st.button("🔄 데이터 수집 및 분석 실행", use_container_width=True):
-            with st.spinner("데이터 수집 및 분석 중..."):
-                reporter = get_reporter()
-                if reporter:
-                    try:
-                        reporter.generate_weekly_analysis_report()
-                        st.success("✅ 분석 완료!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ 오류: {e}")
+            st.session_state['analysis_running'] = True
+            st.rerun()
         
         st.markdown("---")
         if st.button("🚪 로그아웃", use_container_width=True):
             st.session_state['authenticated'] = False
             st.rerun()
+    
+    # 분석 실행 중인 경우
+    if st.session_state.get('analysis_running', False):
+        reporter = get_reporter()
+        if reporter:
+            try:
+                # 메인 영역에 진행률 바 및 상태 텍스트 생성
+                st.header("🔄 데이터 수집 및 분석 실행 중...")
+                
+                # Supabase 연결 상태 확인 섹션
+                st.subheader("🔌 Supabase 연결 상태")
+                db_status_container = st.container()
+                
+                with db_status_container:
+                    if reporter.db_conn:
+                        st.success(f"✅ 연결 성공: {reporter.db_connection_status}")
+                        if reporter.db_connection_type:
+                            st.info(f"연결 타입: {reporter.db_connection_type}")
+                        
+                        # 테이블 존재 여부 확인
+                        try:
+                            cursor = reporter.db_conn.cursor()
+                            cursor.execute("""
+                                SELECT table_name 
+                                FROM information_schema.tables 
+                                WHERE table_schema = 'public'
+                                ORDER BY table_name;
+                            """)
+                            tables = [row[0] for row in cursor.fetchall()]
+                            cursor.close()
+                            
+                            required_tables = ['messages', 'channels', 'users', 'gpt_analyses']
+                            existing_tables = [t for t in required_tables if t in tables]
+                            missing_tables = [t for t in required_tables if t not in tables]
+                            
+                            if existing_tables:
+                                st.success(f"✅ 테이블 확인: {len(existing_tables)}/{len(required_tables)}개 존재")
+                            if missing_tables:
+                                st.warning(f"⚠️ 테이블 누락: {', '.join(missing_tables)}")
+                        except Exception as e:
+                            st.warning(f"⚠️ 테이블 확인 실패: {str(e)[:100]}")
+                    else:
+                        st.error(f"❌ 연결 실패: {reporter.db_connection_status}")
+                
+                st.markdown("---")
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # 로그를 저장할 리스트
+                log_messages = []
+                
+                # 진행률 및 로그를 저장할 변수
+                current_progress = 0.0
+                current_status = "초기화 중..."
+                
+                def update_progress(progress_value: float, status: str):
+                    """진행률 업데이트 콜백"""
+                    nonlocal current_progress, current_status
+                    current_progress = progress_value
+                    current_status = status
+                    progress_bar.progress(progress_value)
+                    status_text.markdown(f"### 진행률: {int(progress_value * 100)}%")
+                    status_text.caption(status)
+                
+                def log_message(message: str):
+                    """로그 메시지 콜백"""
+                    log_messages.append(message)
+                    # 최근 200개만 유지 (메모리 절약)
+                    if len(log_messages) > 200:
+                        log_messages.pop(0)
+                
+                # 콜백 함수 설정
+                reporter.progress_callback = update_progress
+                reporter.log_callback = log_message
+                
+                # 초기 진행률 표시
+                progress_bar.progress(0)
+                status_text.markdown("### 진행률: 0%")
+                status_text.caption("🔄 시작 중... 잠시만 기다려주세요.")
+                
+                # 로그 표시 영역 (진행률 아래에 배치)
+                st.markdown("---")
+                st.subheader("📋 실시간 실행 로그")
+                log_placeholder = st.empty()
+                log_placeholder.info("📝 로그가 곧 표시됩니다. 분석이 진행 중입니다...")
+                
+                # 실시간 로그 업데이트를 위한 컨테이너
+                log_display_container = st.container()
+                
+                # 분석 실행
+                try:
+                    # 분석 실행
+                    reporter.generate_weekly_analysis_report()
+                    
+                    # 완료 후 최종 상태 표시
+                    progress_bar.progress(1.0)
+                    status_text.markdown("### ✅ 진행률: 100%")
+                    status_text.caption("분석 완료!")
+                    
+                    # 최종 로그 표시 (반드시 표시)
+                    if log_messages:
+                        with log_display_container:
+                            st.success(f"✅ 총 {len(log_messages)}개의 로그 메시지가 수집되었습니다.")
+                            
+                            # 최근 로그 표시
+                            recent_logs = log_messages[-100:]
+                            log_text = "\n".join(recent_logs)
+                            log_placeholder.text_area(
+                                "", 
+                                value=log_text, 
+                                height=400, 
+                                label_visibility="collapsed", 
+                                key="final_logs"
+                            )
+                            
+                            # 전체 로그는 expander에
+                            with st.expander("📋 전체 실행 로그 보기", expanded=False):
+                                full_log_text = "\n".join(log_messages)
+                                st.text_area(
+                                    "", 
+                                    value=full_log_text, 
+                                    height=500, 
+                                    label_visibility="collapsed", 
+                                    key="full_logs"
+                                )
+                            
+                            # DB 통계 표시
+                            st.markdown("---")
+                            st.subheader("📊 DB 저장 통계")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("메시지 저장", f"{reporter.db_stats['messages_saved']}개", 
+                                         delta=f"-{reporter.db_stats['messages_failed']}개 실패" if reporter.db_stats['messages_failed'] > 0 else None)
+                                st.metric("채널 저장", f"{reporter.db_stats['channels_saved']}개",
+                                         delta=f"-{reporter.db_stats['channels_failed']}개 실패" if reporter.db_stats['channels_failed'] > 0 else None)
+                            with col2:
+                                st.metric("사용자 저장", f"{reporter.db_stats['users_saved']}개",
+                                         delta=f"-{reporter.db_stats['users_failed']}개 실패" if reporter.db_stats['users_failed'] > 0 else None)
+                                st.metric("GPT 분석 저장", f"{reporter.db_stats['analyses_saved']}개",
+                                         delta=f"-{reporter.db_stats['analyses_failed']}개 실패" if reporter.db_stats['analyses_failed'] > 0 else None)
+                    else:
+                        log_placeholder.warning("⚠️ 로그 메시지가 수집되지 않았습니다. 콜백이 제대로 작동하지 않았을 수 있습니다.")
+                    
+                    # 완료 표시
+                    st.success("✅ 분석 완료!")
+                    st.balloons()
+                    
+                    st.session_state['analysis_running'] = False
+                    time.sleep(3)  # 완료 메시지를 보여주기 위한 대기
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ 분석 중 오류 발생: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    
+                    # 오류 발생 시에도 로그 표시
+                    if log_messages:
+                        with log_display_container:
+                            st.error(f"❌ 오류 발생! 수집된 로그: {len(log_messages)}개")
+                            with st.expander("📋 오류 전 로그 보기", expanded=True):
+                                log_text = "\n".join(log_messages)
+                                st.text_area("", value=log_text, height=400, label_visibility="collapsed", key="error_logs")
+                    else:
+                        log_placeholder.error("❌ 오류가 발생했고 로그도 수집되지 않았습니다.")
+                    
+                    st.session_state['analysis_running'] = False
+                
+            except Exception as e:
+                st.error(f"❌ 오류: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+                st.session_state['analysis_running'] = False
+        else:
+            st.session_state['analysis_running'] = False
+        return
     
     # 리포터 초기화
     reporter = get_reporter()
