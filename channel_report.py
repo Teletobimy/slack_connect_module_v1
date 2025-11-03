@@ -86,12 +86,40 @@ class SlackChannelReporter:
         self.db_conn_string = db_connection_string or os.getenv("DB_CONNECTION_STRING")
         self.db_conn = None
         if self.db_conn_string and SUPABASE_AVAILABLE:
+            # Direct connection 시도
             try:
                 self.db_conn = connect(self.db_conn_string)
-                print("✅ Supabase 연결 성공")
+                print("✅ Supabase 연결 성공 (Direct connection)")
             except Exception as e:
-                print(f"⚠️ Supabase 연결 실패: {e}")
-                self.db_conn = None
+                error_msg = str(e).lower()
+                # IPv4/DNS 문제인 경우 Session Pooler로 재시도
+                if "could not translate host name" in error_msg or "name or service not known" in error_msg:
+                    print(f"⚠️ Direct connection 실패 (IPv4/DNS 문제): {e}")
+                    print("🔄 Session Pooler로 재시도 중...")
+                    
+                    # Session Pooler 연결 문자열 생성 (포트 6543)
+                    pooler_string = None
+                    if ":5432/" in self.db_conn_string:
+                        pooler_string = self.db_conn_string.replace(":5432/", ":6543/postgres")
+                    elif ":5432" in self.db_conn_string:
+                        pooler_string = self.db_conn_string.replace(":5432", ":6543")
+                    
+                    if pooler_string:
+                        try:
+                            self.db_conn = connect(pooler_string)
+                            print("✅ Supabase 연결 성공 (Session Pooler)")
+                            self.db_conn_string = pooler_string  # 나중에 사용하기 위해 저장
+                        except Exception as e2:
+                            print(f"⚠️ Session Pooler 연결도 실패: {e2}")
+                            print("💡 Supabase 대시보드에서 Session Pooler 연결 문자열을 직접 확인하세요.")
+                            self.db_conn = None
+                    else:
+                        print("💡 Session Pooler 연결 문자열을 수동으로 설정하세요:")
+                        print("   포트를 6543으로 변경: postgresql://...@host:6543/postgres")
+                        self.db_conn = None
+                else:
+                    print(f"⚠️ Supabase 연결 실패: {e}")
+                    self.db_conn = None
         else:
             if not SUPABASE_AVAILABLE:
                 print("⚠️ Supabase 라이브러리를 사용할 수 없습니다. DB 저장이 비활성화됩니다.")
