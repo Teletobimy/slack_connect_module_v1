@@ -850,11 +850,12 @@ class SlackChannelReporter:
         if not messages:
             return None
         
-        # 최신 30개만 선택 (이미 클린된 텍스트)
-        samples = sorted(messages, key=lambda m: m["datetime"])[-30:]
+        # 전체 메시지 사용 (월별 분석이므로 전체 메시지 사용)
+        # 날짜순으로 정렬
+        sorted_messages = sorted(messages, key=lambda m: m["datetime"])
         sample_lines = []
         
-        for m in samples:
+        for m in sorted_messages:
             date_str = m["datetime"].strftime("%Y-%m-%d %H:%M")
             text = m["text"][:400]  # 최대 400자
             channel = m.get("channel", "unknown")
@@ -868,7 +869,7 @@ class SlackChannelReporter:
 [대상] {user_name}
 [기간] {month_range}
 
-[메시지 샘플(최신 50)]
+[전체 메시지 ({len(sorted_messages)}개)]
 {messages_str}
 
 위 메시지들을 분석하여 다음 정보를 파악하고 보고하세요:
