@@ -331,13 +331,13 @@ class SlackChannelReporter:
         
         return text
     
-    def check_existing_week(self, user_id: str, week_start: datetime) -> bool:
+    def check_existing_month(self, user_id: str, month_start: datetime) -> bool:
         """
-        DB에서 특정 사용자의 특정 주차 분석이 이미 존재하는지 확인 (gpt_analyses 테이블 기준)
+        DB에서 특정 사용자의 특정 월 분석이 이미 존재하는지 확인 (gpt_analyses 테이블 기준)
         
         Args:
             user_id: Slack 사용자 ID
-            week_start: 주 시작일 (월요일)
+            month_start: 월 시작일 (1일)
             
         Returns:
             존재 여부 (True/False)
@@ -349,13 +349,13 @@ class SlackChannelReporter:
             cursor = self.db_conn.cursor()
             cursor.execute(
                 "SELECT COUNT(*) FROM gpt_analyses WHERE user_id = %s AND week_start = %s",
-                (user_id, week_start.date())
+                (user_id, month_start.date())
             )
             count = cursor.fetchone()[0]
             cursor.close()
             return count > 0
         except Exception as e:
-            self._log(f"⚠️ [DB] 주차 확인 조회 오류: {str(e)[:200]}")
+            self._log(f"⚠️ [DB] 월별 확인 조회 오류: {str(e)[:200]}")
             return False
     
     def save_message_to_db(self, msg: Dict[str, Any], channel_id: str, channel_type: str):
@@ -477,14 +477,14 @@ class SlackChannelReporter:
                 self.db_conn.rollback()
             return False
     
-    def save_gpt_analysis_to_db(self, user_id: str, week_start: datetime, week_range: str, analysis_text: str):
+    def save_gpt_analysis_to_db(self, user_id: str, month_start: datetime, month_range: str, analysis_text: str):
         """
         GPT 분석 결과를 DB에 저장
         
         Args:
             user_id: Slack 사용자 ID
-            week_start: 주 시작일
-            week_range: 주차 범위 문자열
+            month_start: 월 시작일
+            month_range: 월 범위 문자열
             analysis_text: 분석 결과 텍스트
         """
         if not self.db_conn:
@@ -497,16 +497,16 @@ class SlackChannelReporter:
                 """INSERT INTO gpt_analyses (user_id, week_start, week_range, analysis_text)
                    VALUES (%s, %s, %s, %s)
                    ON CONFLICT (user_id, week_start) DO UPDATE SET analysis_text = EXCLUDED.analysis_text, created_at = CURRENT_TIMESTAMP""",
-                (user_id, week_start.date(), week_range, analysis_text)
+                (user_id, month_start.date(), month_range, analysis_text)
             )
             self.db_conn.commit()
             cursor.close()
             self.db_stats['analyses_saved'] += 1
-            self._log(f"✅ [DB] GPT 분석 저장 성공: user_id={user_id}, week={week_range}")
+            self._log(f"✅ [DB] GPT 분석 저장 성공: user_id={user_id}, month={month_range}")
             return True
         except Exception as e:
             self.db_stats['analyses_failed'] += 1
-            self._log(f"❌ [DB] GPT 분석 저장 오류 (user_id={user_id}, week={week_range}): {str(e)[:200]}")
+            self._log(f"❌ [DB] GPT 분석 저장 오류 (user_id={user_id}, month={month_range}): {str(e)[:200]}")
             if self.db_conn:
                 self.db_conn.rollback()
             return False
@@ -778,19 +778,24 @@ class SlackChannelReporter:
     def get_period_range(self) -> tuple:
         """
         분석 기간 계산
-        - 첫 실행: 2025-10-20부터 오늘까지
-        - 이후 실행: 전주 월요일부터 오늘까지
+        - 첫 실행: 2025-09-01부터 오늘까지
+        - 이후 실행: 전월 1일부터 오늘까지
         
         Returns:
             (start_date, end_date) tuple
         """
         kst = timezone(timedelta(hours=9))
         today = datetime.now(kst)
-        first_run_date = datetime(2025, 10, 20, 0, 0, 0, tzinfo=kst)
+        first_run_date = datetime(2025, 9, 1, 0, 0, 0, tzinfo=kst)
         
-        # 전주 월요일 계산
-        days_since_monday = today.weekday()  # 월요일=0
-        last_monday = today - timedelta(days=days_since_monday + 7)  # 전주 월요일
+        # 전월 1일 계산
+        if today.month == 1:
+            last_month = 12
+            last_year = today.year - 1
+        else:
+            last_month = today.month - 1
+            last_year = today.year
+        last_month_start = datetime(last_year, last_month, 1, 0, 0, 0, tzinfo=kst)
         
         # 첫 실행인지 확인 (DB에 데이터가 있는지)
         has_previous_data = False
@@ -804,44 +809,37 @@ class SlackChannelReporter:
                 pass
         
         if has_previous_data:
-            start_date = last_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_date = last_month_start
         else:
             start_date = first_run_date
         
         end_date = today
         return (start_date, end_date)
     
-    def get_week_start_date(self, date: datetime) -> datetime:
+    def get_month_start_date(self, date: datetime) -> datetime:
         """
-        주어진 날짜가 속한 주의 월요일 반환
+        주어진 날짜가 속한 월의 1일 반환
         
         Args:
             date: datetime 객체
             
         Returns:
-            해당 주의 월요일 datetime 객체
+            해당 월의 1일 datetime 객체
         """
-        days_since_monday = date.weekday()  # 월요일=0
-        monday = date - timedelta(days=days_since_monday)
-        return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        return date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
-    def get_week_number(self, date: datetime) -> int:
-        """날짜로부터 주 번호 계산 (10월 20일을 1주차로 시작)"""
-        kst = timezone(timedelta(hours=9))
-        base_date = datetime(2025, 10, 20, tzinfo=kst)
-        base_monday = self.get_week_start_date(base_date)
-        target_monday = self.get_week_start_date(date)
-        days_diff = (target_monday.date() - base_monday.date()).days
-        return (days_diff // 7) + 1
+    def get_month_key(self, date: datetime) -> str:
+        """날짜로부터 월 키 계산 (예: "2025-09")"""
+        return date.strftime("%Y-%m")
     
-    def analyze_user_work_with_gpt(self, user_name: str, week_range: str, messages: List[Dict[str, Any]]) -> Optional[str]:
+    def analyze_user_work_with_gpt(self, user_name: str, month_range: str, messages: List[Dict[str, Any]]) -> Optional[str]:
         """
-        GPT를 사용하여 담당자의 주별 업무를 분석
+        GPT를 사용하여 담당자의 월별 업무를 분석
         
         Args:
             user_name: 담당자 이름
-            week_range: 주차 범위 문자열 (예: "10/01~10/07")
-            messages: 해당 주의 메시지 리스트 (clean_text가 적용된 텍스트 포함)
+            month_range: 월 범위 문자열 (예: "2025년 9월")
+            messages: 해당 월의 메시지 리스트 (clean_text가 적용된 텍스트 포함)
         
         Returns:
             분석 결과 텍스트 또는 None
@@ -868,41 +866,32 @@ class SlackChannelReporter:
 당신은 CEO/임원에게 보고하는 '업무 퍼포먼스 코치'입니다.
 
 [대상] {user_name}
-[기간] {week_range}
+[기간] {month_range}
 
-[메시지 샘플(최신 30)]
+[메시지 샘플(최신 50)]
 {messages_str}
 
 위 메시지들을 분석하여 다음 정보를 파악하고 보고하세요:
 
-1) 주요 업무 및 성과 요약(불릿 3~6개)
-   - 메시지 내용을 바탕으로 담당자의 주요 업무와 성과를 요약
+1) 주요 업무 (명시적으로 작성, 불릿 3~6개)
+   - 메시지 내용을 바탕으로 담당자가 실제로 수행한 구체적인 업무를 명시적으로 나열
+   - 각 업무 항목은 무엇을 했는지가 명확히 드러나도록 작성
+   - 예: "프로젝트 X의 API 설계 및 구현 완료", "클라이언트 Y와의 미팅 및 요구사항 정리" 등
    - 정량 지표: 총 메시지 수, 활성일 수, 평균 메시지 간격, 최대 공백 시간
-   - 완료 신호 수(완료, 완료됨, 끝남, 마무리 등 키워드 기반)
-   - 블로커 신호 수(막힘, 문제, 지연, 어려움, 도와주세요 등 키워드 기반)
-   - 체크리스트 진행률([x], [o], [-], 완료 표시 등)
    - 협업성(멘션 수, @사용자 언급 횟수)
    - 상위 활동 채널 및 커버리지
 
-2) 진행속도/진행률 판단(근거 포함)
-   - 업무 진행 속도 평가 (빠름/보통/느림)
-   - 구체적 근거 제시
-
-3) 리스크/블로커와 해결책(불릿)
-   - 발견된 리스크나 블로커 요약
-   - 각각에 대한 해결 방안 제시
-
-4) Business 조언(우선순위 재정렬, 협업설계, 리소스/승인 필요) - 3~5개
+2) Business 조언(우선순위 재정렬, 협업설계, 리소스/승인 필요) - 3~5개
    - 경영진이 고려해야 할 업무 조정 사항
    - 협업 개선 방안
    - 필요한 리소스나 승인 사항
 
-5) Personal 코칭(커뮤니케이션 습관, 집중·체력·정서관리 팁) - 3~5개
+3) Personal 코칭(커뮤니케이션 습관, 집중·체력·정서관리 팁) - 3~5개
    - 개인 성장을 위한 코칭 포인트
    - 커뮤니케이션 스타일 개선
    - 워크라이프 밸런스 관련 조언
 
-6) 다음 주 KPI 제안(정량 목표 3개: 예, 완료신호≥X, 블로커신호≤Y, 체크리스트 진행률≥Z%)
+4) 다음 달 KPI 제안(정량 목표 3개)
    - 측정 가능한 목표 설정
    - 구체적인 수치 제시
 
@@ -922,7 +911,7 @@ class SlackChannelReporter:
             
             return response.choices[0].message.content.strip()
         except Exception as e:
-            print(f"  ⚠️ GPT 분석 오류 ({user_name} {week_range}): {e}")
+            print(f"  ⚠️ GPT 분석 오류 ({user_name} {month_range}): {e}")
             return None
     
     def _log(self, message: str):
@@ -1008,15 +997,15 @@ class SlackChannelReporter:
     
     def generate_weekly_analysis_report(self):
         """
-        10월 1일부터 오늘까지의 메시지를 수집하고 주별로 분석하여
+        9월 1일부터 오늘까지의 메시지를 수집하고 월별로 분석하여
         CEO/관리자용 업무 분석 리포트 생성
         """
         self._log("=" * 80)
-        self._log("📊 Slack 담당자별 주간 업무 분석 리포트 (CEO/관리자용)")
+        self._log("📊 Slack 담당자별 월별 업무 분석 리포트 (CEO/관리자용)")
         self._log("=" * 80)
         self._log("")
         
-        # 기간 설정 (10/20부터 또는 전주 월요일부터)
+        # 기간 설정 (9/1부터 또는 전월 1일부터)
         start_date, end_date = self.get_period_range()
         
         self._log(f"📅 조회 기간: {start_date.strftime('%Y년 %m월 %d일')} ~ {end_date.strftime('%Y년 %m월 %d일')}")
@@ -1037,9 +1026,9 @@ class SlackChannelReporter:
         self._log("=" * 80)
         self._log("")
         
-        # 담당자별, 주별 메시지 저장
-        # 구조: {user_name: {week_num: [{text, timestamp, channel, date, datetime}]}}
-        user_weekly_messages = defaultdict(lambda: defaultdict(list))
+        # 담당자별, 월별 메시지 저장
+        # 구조: {user_name: {month_key: [{text, timestamp, channel, date, datetime}]}}
+        user_monthly_messages = defaultdict(lambda: defaultdict(list))
         
         # 각 채널에서 메시지 수집
         total_channels = len(channels)
@@ -1101,9 +1090,9 @@ class SlackChannelReporter:
                         text = self.clean_text(msg.get("text", ""))
                         ts = float(msg.get("ts", 0))
                         msg_time = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(kst)
-                        week_num = self.get_week_number(msg_time)
+                        month_key = self.get_month_key(msg_time)
                         
-                        user_weekly_messages[user_name][week_num].append({
+                        user_monthly_messages[user_name][month_key].append({
                             "text": text,
                             "timestamp": ts,
                             "channel": channel_name,
@@ -1121,33 +1110,47 @@ class SlackChannelReporter:
         self._log("")
         self._update_progress(0.60, "메시지 수집 완료, GPT 분석 준비 중...")
         
-        # 담당자별, 주별 GPT 분석 수행
-        user_weekly_analysis = defaultdict(dict)
+        # 담당자별, 월별 GPT 분석 수행
+        user_monthly_analysis = defaultdict(dict)
         
-        total_users = len(user_weekly_messages)
+        total_users = len(user_monthly_messages)
         user_idx = 0
         
-        # 전체 주차 수 계산
-        total_weeks = sum(len(weeks) for weeks in user_weekly_messages.values())
-        analyzed_weeks = 0
-        skipped_weeks = 0
+        # 전체 월 수 계산
+        total_months = sum(len(months) for months in user_monthly_messages.values())
+        analyzed_months = 0
+        skipped_months = 0
         
-        for user_name, weekly_data in sorted(user_weekly_messages.items()):
+        # 현재 날짜 확인 (중간일 때 현재 달 숨기기)
+        kst = timezone(timedelta(hours=9))
+        today = datetime.now(kst)
+        current_month_key = self.get_month_key(today)
+        
+        for user_name, monthly_data in sorted(user_monthly_messages.items()):
             user_idx += 1
-            weeks_in_user = len(weekly_data)
+            months_in_user = len(monthly_data)
             
             self._log(f"[{user_idx}/{total_users}] 👤 {user_name} 분석 중...")
             
-            kst = timezone(timedelta(hours=9))
-            for week_num in sorted(weekly_data.keys()):
-                messages = weekly_data[week_num]
+            for month_key in sorted(monthly_data.keys()):
+                # 현재 달이고 15일 이전이면 스킵
+                if month_key == current_month_key and today.day < 15:
+                    skipped_months += 1
+                    analyzed_months += 1
+                    self._log(f"  → {month_key} ({len(monthly_data[month_key])}개 메시지) 현재 달 중간이라 스킵 ⏭️")
+                    
+                    # 진행률 업데이트 (GPT 분석 단계: 60% ~ 95%)
+                    if total_months > 0:
+                        analysis_progress = 0.60 + (analyzed_months / total_months) * 0.35
+                        self._update_progress(analysis_progress, f"GPT 분석 진행 중 [{analyzed_months}/{total_months}] (스킵: {skipped_months})")
+                    continue
                 
-                # 주차 범위 계산 (10/20 기준)
-                base_date = datetime(2025, 10, 20, tzinfo=kst)
-                base_monday = self.get_week_start_date(base_date)
-                week_start = base_monday + timedelta(days=(week_num-1)*7)
-                week_end = min(week_start + timedelta(days=6), end_date)
-                week_range = f"{week_start.strftime('%m/%d')}~{week_end.strftime('%m/%d')}"
+                messages = monthly_data[month_key]
+                
+                # 월 시작일 계산
+                year, month = map(int, month_key.split('-'))
+                month_start = datetime(year, month, 1, 0, 0, 0, tzinfo=kst)
+                month_range = f"{year}년 {month}월"
                 
                 # 사용자 ID 찾기 (첫 메시지에서)
                 user_id = None
@@ -1155,62 +1158,62 @@ class SlackChannelReporter:
                     user_id = messages[0].get("user_id")
                 
                 # 중복 체크
-                if user_id and self.check_existing_week(user_id, week_start):
-                    skipped_weeks += 1
-                    analyzed_weeks += 1
-                    self._log(f"  → {week_num}주차 ({week_range}, {len(messages)}개 메시지) 이미 분석됨 ⏭️")
+                if user_id and self.check_existing_month(user_id, month_start):
+                    skipped_months += 1
+                    analyzed_months += 1
+                    self._log(f"  → {month_key} ({month_range}, {len(messages)}개 메시지) 이미 분석됨 ⏭️")
                     
                     # 진행률 업데이트 (GPT 분석 단계: 60% ~ 95%)
-                    if total_weeks > 0:
-                        analysis_progress = 0.60 + (analyzed_weeks / total_weeks) * 0.35
-                        self._update_progress(analysis_progress, f"GPT 분석 진행 중 [{analyzed_weeks}/{total_weeks}] (스킵: {skipped_weeks})")
+                    if total_months > 0:
+                        analysis_progress = 0.60 + (analyzed_months / total_months) * 0.35
+                        self._update_progress(analysis_progress, f"GPT 분석 진행 중 [{analyzed_months}/{total_months}] (스킵: {skipped_months})")
                     continue
                 
                 # 진행률 업데이트
-                if total_weeks > 0:
-                    analysis_progress = 0.60 + (analyzed_weeks / total_weeks) * 0.35
-                    self._update_progress(analysis_progress, f"GPT 분석 중 [{analyzed_weeks+1}/{total_weeks}] {user_name} - {week_range}")
+                if total_months > 0:
+                    analysis_progress = 0.60 + (analyzed_months / total_months) * 0.35
+                    self._update_progress(analysis_progress, f"GPT 분석 중 [{analyzed_months+1}/{total_months}] {user_name} - {month_range}")
                 
-                self._log(f"  → {week_num}주차 ({week_range}, {len(messages)}개 메시지) 분석 중...")
+                self._log(f"  → {month_key} ({month_range}, {len(messages)}개 메시지) 분석 중...")
                 
-                analysis = self.analyze_user_work_with_gpt(user_name, week_range, messages)
+                analysis = self.analyze_user_work_with_gpt(user_name, month_range, messages)
                 
                 if analysis:
-                    analyzed_weeks += 1
-                    user_weekly_analysis[user_name][week_num] = {
+                    analyzed_months += 1
+                    user_monthly_analysis[user_name][month_key] = {
                         "analysis": analysis,
                         "message_count": len(messages),
                         "messages": messages,
-                        "week_range": week_range,
-                        "week_start": week_start
+                        "month_range": month_range,
+                        "month_start": month_start
                     }
                     
                     # DB에 GPT 분석 결과 저장
                     if user_id:
-                        self.save_gpt_analysis_to_db(user_id, week_start, week_range, analysis)
+                        self.save_gpt_analysis_to_db(user_id, month_start, month_range, analysis)
                     
                     self._log("✅")
                 else:
-                    analyzed_weeks += 1
+                    analyzed_months += 1
                     self._log("⏭️")
         
         self._update_progress(0.95, "분석 완료, 리포트 생성 중...")
         self._log("")
         self._log("=" * 80)
-        self._log("📋 CEO/관리자용 주간 업무 분석 리포트")
+        self._log("📋 CEO/관리자용 월별 업무 분석 리포트")
         self._log("=" * 80)
         self._log("")
         
         # 전체 요약 통계
         total_messages = sum(
             sum(data["message_count"] for data in user_data.values())
-            for user_data in user_weekly_analysis.values()
+            for user_data in user_monthly_analysis.values()
         )
         
-        self._log(f"분석된 담당자 수: {len(user_weekly_analysis)}명")
+        self._log(f"분석된 담당자 수: {len(user_monthly_analysis)}명")
         self._log(f"총 메시지 수: {total_messages}개")
         self._log(f"분석 기간: {start_date.strftime('%Y-%m-%d')} ~ {end_date.strftime('%Y-%m-%d')}")
-        self._log(f"스킵된 주차: {skipped_weeks}개")
+        self._log(f"스킵된 월: {skipped_months}개")
         self._log("")
         
         # DB 저장 통계
@@ -1261,7 +1264,7 @@ def main():
         
         # 리포트 생성
         reporter = SlackChannelReporter(user_token=user_token, openai_api_key=openai_api_key)
-        reporter.generate_weekly_analysis_report()
+        reporter.generate_weekly_analysis_report()  # 함수명은 유지하지만 내부는 월별 분석
         
     except KeyboardInterrupt:
         print("\n\n⚠️ 사용자에 의해 중단되었습니다.")

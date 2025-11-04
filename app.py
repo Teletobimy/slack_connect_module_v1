@@ -74,33 +74,34 @@ def get_reporter() -> Optional[SlackChannelReporter]:
     """SlackChannelReporter 인스턴스 생성"""
     import traceback
     
-    try:
+    # Secrets 확인 (디버그 정보는 expander 안에)
+    user_token = st.secrets.get("SLACK_USER_TOKEN")
+    openai_api_key = st.secrets.get("OPENAI_API_KEY")
+    db_connection_string = st.secrets.get("DB_CONNECTION_STRING")
+    
+    # 디버그 정보를 접기/펼치기 가능한 expander로 감싸기
+    with st.expander("🔍 [디버그 정보]", expanded=False):
         st.info("🔍 [디버그] 리포터 생성 시작...")
-        
-        # 1. Secrets 확인
         st.info("🔍 [디버그] Step 1: Secrets 로드 중...")
-        user_token = st.secrets.get("SLACK_USER_TOKEN")
-        openai_api_key = st.secrets.get("OPENAI_API_KEY")
-        db_connection_string = st.secrets.get("DB_CONNECTION_STRING")
-        
         st.info(f"🔍 [디버그] - SLACK_USER_TOKEN: {'✅ 설정됨' if user_token else '❌ 없음'}")
         st.info(f"🔍 [디버그] - OPENAI_API_KEY: {'✅ 설정됨' if openai_api_key else '⚠️ 없음'}")
         st.info(f"🔍 [디버그] - DB_CONNECTION_STRING: {'✅ 설정됨' if db_connection_string else '⚠️ 없음'}")
+    
+    if not user_token:
+        st.error("❌ SLACK_USER_TOKEN이 설정되지 않았습니다.")
+        return None
+    
+    try:
+        with st.expander("🔍 [디버그 정보]", expanded=False):
+            st.info("🔍 [디버그] Step 2: SlackChannelReporter 인스턴스 생성 중...")
         
-        if not user_token:
-            st.error("❌ SLACK_USER_TOKEN이 설정되지 않았습니다.")
-            return None
+        reporter = SlackChannelReporter(
+            user_token=user_token,
+            openai_api_key=openai_api_key,
+            db_connection_string=db_connection_string
+        )
         
-        # 2. SlackChannelReporter 인스턴스 생성 시도
-        st.info("🔍 [디버그] Step 2: SlackChannelReporter 인스턴스 생성 중...")
-        
-        try:
-            st.info("🔍 [디버그] SlackChannelReporter 클래스 호출 직전...")
-            reporter = SlackChannelReporter(
-                user_token=user_token,
-                openai_api_key=openai_api_key,
-                db_connection_string=db_connection_string
-            )
+        with st.expander("🔍 [디버그 정보]", expanded=False):
             st.info("🔍 [디버그] Step 3: 리포터 객체 생성 완료!")
             
             # 속성 존재 확인 (여러 방법으로)
@@ -115,7 +116,6 @@ def get_reporter() -> Optional[SlackChannelReporter]:
                 st.error(f"❌ [직접접근실패] log_callback 접근 시 AttributeError: {attr_e}")
                 st.error(f"🔍 [디버그] reporter 객체 속성 목록:")
                 st.code("\n".join([x for x in dir(reporter) if not x.startswith('_')]), language='text')
-                return None
             
             # getattr로 접근 시도
             lc_getattr = getattr(reporter, 'log_callback', 'NOT_FOUND')
@@ -123,34 +123,34 @@ def get_reporter() -> Optional[SlackChannelReporter]:
             
             if hasattr(reporter, 'log_callback'):
                 st.info(f"🔍 [디버그] - log_callback 값: {reporter.log_callback}")
-            
-            return reporter
-        except AttributeError as ae:
+        
+        return reporter
+    except AttributeError as ae:
+        with st.expander("🔍 [디버그 정보 - 오류]", expanded=True):
             st.error(f"❌ [AttributeError] 속성 오류 발생: {ae}")
             st.error(f"🔍 [디버그] 오류 발생 위치: {traceback.format_exc()}")
             st.code(traceback.format_exc(), language='python')
-            return None
-        except Exception as init_e:
+        return None
+    except Exception as init_e:
+        with st.expander("🔍 [디버그 정보 - 오류]", expanded=True):
             st.error(f"❌ [InitError] 초기화 중 오류: {init_e}")
             st.error(f"🔍 [디버그] 오류 타입: {type(init_e).__name__}")
             st.error(f"🔍 [디버그] 전체 스택 트레이스:")
             st.code(traceback.format_exc(), language='python')
-            return None
-            
-    except Exception as e:
-        st.error(f"❌ [GeneralError] 예상치 못한 오류: {e}")
-        st.error(f"🔍 [디버그] 오류 타입: {type(e).__name__}")
-        st.error(f"🔍 [디버그] 전체 스택 트레이스:")
-        st.code(traceback.format_exc(), language='python')
         return None
 
 
 def load_analyses_from_db(reporter: SlackChannelReporter) -> Dict[str, Dict]:
-    """DB에서 분석 결과 로드"""
+    """DB에서 분석 결과 로드 (월별)"""
     if not reporter:
         return {}
     if not hasattr(reporter, 'db_conn') or not reporter.db_conn:
         return {}
+    
+    # 현재 날짜 확인 (중간일 때 현재 달 숨기기)
+    kst = timezone(timedelta(hours=9))
+    today = datetime.now(kst)
+    current_month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
     try:
         cursor = reporter.db_conn.cursor()
@@ -163,16 +163,26 @@ def load_analyses_from_db(reporter: SlackChannelReporter) -> Dict[str, Dict]:
         
         results = {}
         for row in cursor.fetchall():
-            user_id, user_name, week_start, week_range, analysis_text = row
+            user_id, user_name, month_start, month_range, analysis_text = row
             user_name = user_name or user_id
+            
+            # month_start가 date 객체인 경우 datetime으로 변환
+            if isinstance(month_start, type(today.date())):
+                month_start_dt = datetime.combine(month_start, datetime.min.time()).replace(tzinfo=kst)
+            else:
+                month_start_dt = month_start
+            
+            # 현재 달이고 15일 이전이면 스킵
+            if month_start_dt.date() == current_month_start.date() and today.day < 15:
+                continue
             
             if user_name not in results:
                 results[user_name] = {}
             
-            results[user_name][week_start] = {
-                "week_range": week_range,
+            results[user_name][month_start] = {
+                "month_range": month_range,
                 "analysis": analysis_text,
-                "week_start": week_start
+                "month_start": month_start
             }
         
         cursor.close()
@@ -410,13 +420,13 @@ def main_dashboard():
     # 전체 요약 통계
     st.header("📈 전체 요약")
     total_users = len(analyses)
-    total_weeks = sum(len(weeks) for weeks in analyses.values())
+    total_months = sum(len(months) for months in analyses.values())
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("분석된 담당자 수", f"{total_users}명")
     with col2:
-        st.metric("총 주차 수", f"{total_weeks}주")
+        st.metric("총 월 수", f"{total_months}개월")
     with col3:
         kst = timezone(timedelta(hours=9))
         today = datetime.now(kst)
@@ -435,42 +445,48 @@ def main_dashboard():
     selected_user = st.selectbox("담당자 선택", [""] + user_names, key="user_select")
     
     if selected_user:
-        user_weeks = analyses[selected_user]
-        week_starts = sorted(user_weeks.keys(), reverse=True)
+        user_months = analyses[selected_user]
+        month_starts = sorted(user_months.keys(), reverse=True)
         
-        st.subheader(f"📋 {selected_user} - 주간 분석 리포트")
+        st.subheader(f"📋 {selected_user} - 월별 분석 리포트")
         
-        for week_start in week_starts:
-            week_data = user_weeks[week_start]
+        for month_start in month_starts:
+            month_data = user_months[month_start]
             
-            with st.expander(f"📅 {week_data['week_range']} ({week_start})", expanded=True):
+            # month_start가 date인 경우 문자열로 변환
+            if isinstance(month_start, type(today.date())):
+                month_display = month_start.strftime("%Y-%m")
+            else:
+                month_display = str(month_start)
+            
+            with st.expander(f"📅 {month_data['month_range']} ({month_display})", expanded=True):
                 st.markdown("### 🤖 GPT 분석 결과")
-                st.markdown(week_data['analysis'])
+                st.markdown(month_data['analysis'])
                 
                 # 다운로드 버튼
                 col1, col2 = st.columns(2)
                 with col1:
                     json_data = {
                         "user": selected_user,
-                        "week_range": week_data['week_range'],
-                        "week_start": week_start.isoformat(),
-                        "analysis": week_data['analysis']
+                        "month_range": month_data['month_range'],
+                        "month_start": month_start.isoformat() if hasattr(month_start, 'isoformat') else str(month_start),
+                        "analysis": month_data['analysis']
                     }
                     st.download_button(
                         label="📥 JSON 다운로드",
                         data=json.dumps(json_data, ensure_ascii=False, indent=2),
-                        file_name=f"{selected_user}_{week_start}_report.json",
+                        file_name=f"{selected_user}_{month_display}_report.json",
                         mime="application/json"
                     )
                 with col2:
-                    md_content = f"# {selected_user} - 주간 분석 리포트\n\n"
-                    md_content += f"**기간**: {week_data['week_range']}\n\n"
-                    md_content += f"**분석일**: {week_start}\n\n---\n\n"
-                    md_content += f"## GPT 분석 결과\n\n{week_data['analysis']}"
+                    md_content = f"# {selected_user} - 월별 분석 리포트\n\n"
+                    md_content += f"**기간**: {month_data['month_range']}\n\n"
+                    md_content += f"**분석일**: {month_display}\n\n---\n\n"
+                    md_content += f"## GPT 분석 결과\n\n{month_data['analysis']}"
                     st.download_button(
                         label="📥 Markdown 다운로드",
                         data=md_content,
-                        file_name=f"{selected_user}_{week_start}_report.md",
+                        file_name=f"{selected_user}_{month_display}_report.md",
                         mime="text/markdown"
                     )
     else:
@@ -481,11 +497,11 @@ def main_dashboard():
         for idx, user_name in enumerate(user_names):
             col_idx = idx % 3
             with cols[col_idx]:
-                weeks_count = len(analyses[user_name])
+                months_count = len(analyses[user_name])
                 st.markdown(f"""
                 <div class="metric-container">
                     <h3>👤 {user_name}</h3>
-                    <p>분석된 주차: <strong>{weeks_count}주</strong></p>
+                    <p>분석된 월: <strong>{months_count}개월</strong></p>
                 </div>
                 """, unsafe_allow_html=True)
 
