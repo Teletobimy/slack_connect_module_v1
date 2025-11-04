@@ -205,6 +205,42 @@ def main_dashboard():
             st.rerun()
         
         st.markdown("---")
+        
+        # 리포터 초기화 (삭제 기능을 위해)
+        sidebar_reporter = get_reporter()
+        if sidebar_reporter and sidebar_reporter.db_conn:
+            st.subheader("🗑️ 데이터 관리")
+            if st.button("🗑️ 기존 주별 데이터 삭제", use_container_width=True, type="secondary"):
+                try:
+                    cursor = sidebar_reporter.db_conn.cursor()
+                    # 먼저 삭제될 데이터 수 확인
+                    cursor.execute("""
+                        SELECT COUNT(*) 
+                        FROM gpt_analyses 
+                        WHERE EXTRACT(DAY FROM week_start) != 1
+                    """)
+                    count = cursor.fetchone()[0]
+                    
+                    if count > 0:
+                        # 실제 삭제 실행
+                        cursor.execute("""
+                            DELETE FROM gpt_analyses 
+                            WHERE EXTRACT(DAY FROM week_start) != 1
+                        """)
+                        deleted_count = cursor.rowcount
+                        sidebar_reporter.db_conn.commit()
+                        cursor.close()
+                        st.success(f"✅ {deleted_count}개의 주별 데이터가 삭제되었습니다.")
+                        st.rerun()
+                    else:
+                        cursor.close()
+                        st.info("ℹ️ 삭제할 주별 데이터가 없습니다. (모든 데이터가 월별 데이터입니다)")
+                except Exception as e:
+                    st.error(f"❌ 삭제 오류: {e}")
+                    if sidebar_reporter.db_conn:
+                        sidebar_reporter.db_conn.rollback()
+        
+        st.markdown("---")
         if st.button("🚪 로그아웃", use_container_width=True):
             st.session_state['authenticated'] = False
             st.rerun()
@@ -516,4 +552,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
